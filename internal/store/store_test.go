@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -56,6 +57,9 @@ func TestMigrateIdempotent(t *testing.T) {
 }
 
 func TestOpenPathWithQuestionMark(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not permit '?' in file names")
+	}
 	root := t.TempDir()
 	dir := filepath.Join(root, "with?mark")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

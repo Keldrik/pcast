@@ -82,7 +82,17 @@ func (s *Store) DB() *sql.DB {
 }
 
 func sqliteDSN(path string) string {
-	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+	path = filepath.ToSlash(path)
+	// A drive letter is otherwise parsed as the URI authority (file://C:/...).
+	if isWindowsDrivePath(path) {
+		path = "/" + path
+	}
+	return (&url.URL{Scheme: "file", Path: path}).String()
+}
+
+func isWindowsDrivePath(path string) bool {
+	return len(path) >= 3 && path[1] == ':' && path[2] == '/' &&
+		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'))
 }
 
 func retrySQLite(ctx context.Context, fn func() error) error {
