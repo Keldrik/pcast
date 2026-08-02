@@ -52,7 +52,12 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	if err := s.db.Close(); err != nil {
+	// Checkpoint WAL so Windows releases sidecar handles before the file is deleted
+	// (test TempDir cleanup, data-dir removal).
+	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	err := s.db.Close()
+	s.db = nil
+	if err != nil {
 		return model.Storage("close database", err)
 	}
 	return nil

@@ -44,7 +44,8 @@ func runCLI(t *testing.T, dataDir string, args ...string) (stdout, stderr string
 			return &playerAdapter{r: testPlayerRunner(t)}
 		},
 	}
-	root := cli.NewRoot(opts)
+	root, cleanup := cli.NewRoot(opts)
+	defer func() { _ = cleanup() }()
 	root.SetArgs(append([]string{"--data-dir", dataDir}, args...))
 	err := root.ExecuteContext(context.Background())
 	if err != nil && !cli.IsPartial(err) {

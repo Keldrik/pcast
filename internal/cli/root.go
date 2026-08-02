@@ -54,7 +54,12 @@ type Root struct {
 }
 
 // NewRoot constructs the cobra command tree.
-func NewRoot(opts Options) *cobra.Command {
+//
+// cleanup closes resources opened during Execute (the SQLite store). Callers
+// must invoke it after Execute returns. Cobra skips PersistentPostRun when
+// RunE returns an error, so relying on PostRun alone leaves the DB open and
+// breaks Windows temp-dir cleanup in tests.
+func NewRoot(opts Options) (cmd *cobra.Command, cleanup func() error) {
 	if opts.Stdout == nil {
 		opts.Stdout = os.Stdout
 	}
@@ -82,7 +87,7 @@ func NewRoot(opts Options) *cobra.Command {
 
 	r := &Root{opts: opts}
 
-	cmd := &cobra.Command{
+	cmd = &cobra.Command{
 		Use:           "pcast",
 		Short:         "Local-first podcast manager and player",
 		Long:          "pcast subscribes to RSS/Atom podcast feeds, tracks episodes locally, and streams them through an installed media player.",
@@ -91,6 +96,7 @@ func NewRoot(opts Options) *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return r.persistentPreRun(cmd)
 		},
+		// Best-effort close on the success path; cleanup still runs after errors.
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
 			return r.close()
 		},
@@ -118,7 +124,7 @@ func NewRoot(opts Options) *cobra.Command {
 	cmd.SetErr(opts.Stderr)
 	cmd.SetIn(opts.Stdin)
 
-	return cmd
+	return cmd, r.close
 }
 
 func (r *Root) versionInfo() model.VersionInfo {

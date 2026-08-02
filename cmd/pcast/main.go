@@ -38,7 +38,8 @@ func run(args []string) int {
 			BuildDate: buildDate,
 		},
 	}
-	root := cli.NewRoot(opts)
+	root, cleanup := cli.NewRoot(opts)
+	defer func() { _ = cleanup() }()
 	root.SetArgs(args)
 	root.SetContext(ctx)
 
