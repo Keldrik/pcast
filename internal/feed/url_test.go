@@ -1,6 +1,9 @@
 package feed
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeURL(t *testing.T) {
 	cases := []struct {
@@ -8,7 +11,9 @@ func TestNormalizeURL(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"https://Example.COM/Feed.xml", "https://example.com/Feed.xml", false},
+		{"HTTPS://Example.COM/Feed.xml", "https://example.com/Feed.xml", false},
+		{"http://[2001:DB8::1]:8080/Feed", "http://[2001:db8::1]:8080/Feed", false},
+		{"http://[::1]:80/a", "http://[::1]/a", false},
 		{"http://example.com:80/a", "http://example.com/a", false},
 		{"https://example.com:443/a", "https://example.com/a", false},
 		{"https://example.com", "https://example.com/", false},
@@ -36,6 +41,25 @@ func TestNormalizeURL(t *testing.T) {
 			t.Errorf("NormalizeURL(%q)=%q want %q", tc.in, got, tc.want)
 		}
 	}
+}
+
+func TestRedactURLRemovesEveryQueryValue(t *testing.T) {
+	got := RedactURL("https://example.test/feed?Token=secret&private=also-secret#fragment")
+	if got == "" || containsAny(got, "secret", "fragment") {
+		t.Fatalf("redacted URL=%q", got)
+	}
+	if !containsAny(got, "REDACTED") {
+		t.Fatalf("expected redacted values in %q", got)
+	}
+}
+
+func containsAny(s string, values ...string) bool {
+	for _, value := range values {
+		if strings.Contains(s, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestParseDurationSeconds(t *testing.T) {

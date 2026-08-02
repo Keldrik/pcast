@@ -58,7 +58,7 @@ func NewClient(userAgent string) *Client {
 		Timeout:   DefaultTimeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= MaxRedirects {
+			if len(via) > MaxRedirects {
 				return fmt.Errorf("stopped after %d redirects", MaxRedirects)
 			}
 			// Reject credentialed redirect targets.

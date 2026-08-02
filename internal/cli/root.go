@@ -148,8 +148,7 @@ func (r *Root) persistentPreRun(cmd *cobra.Command) error {
 	if name == "help" || name == "completion" {
 		return nil
 	}
-	// version command does not need store
-	needsStore := name != "version" && cmd.Parent() != nil
+	needsStore := name != "version" && name != "doctor" && cmd.Parent() != nil
 
 	paths, err := platform.ResolvePaths(r.dataDir, r.opts.Getenv, os.UserHomeDir)
 	if err != nil {
@@ -164,16 +163,37 @@ func (r *Root) persistentPreRun(cmd *cobra.Command) error {
 		return nil
 	}
 
-	if err := platform.EnsureDataDir(paths.DataDir); err != nil {
-		return model.Storage("create data directory", err)
-	}
-
 	open := r.opts.OpenStore
 	if open == nil {
 		open = func(ctx context.Context, path string) (app.StorePort, error) {
 			return store.Open(ctx, path)
 		}
 	}
+	newPlayer := func() app.Player {
+		if r.opts.NewPlayer != nil {
+			return r.opts.NewPlayer()
+		}
+		return &playerAdapter{r: player.New()}
+	}
+
+	// Doctor owns its own setup checks. Opening the database here would turn a
+	// useful structured diagnosis into a generic pre-run storage error.
+	if name == "doctor" {
+		r.application = &app.App{
+			Player:    newPlayer(),
+			Clock:     r.opts.Clock,
+			DataDir:   paths.DataDir,
+			DBPath:    paths.DBPath,
+			OpenStore: open,
+			Version:   r.versionInfo(),
+		}
+		return nil
+	}
+
+	if err := platform.EnsureDataDir(paths.DataDir); err != nil {
+		return model.Storage("create data directory", err)
+	}
+
 	st, err := open(cmd.Context(), paths.DBPath)
 	if err != nil {
 		return err
@@ -189,13 +209,6 @@ func (r *Root) persistentPreRun(cmd *cobra.Command) error {
 		feeds = &feedClientAdapter{c: feed.NewClient(ua)}
 	}
 
-	var play app.Player
-	if r.opts.NewPlayer != nil {
-		play = r.opts.NewPlayer()
-	} else {
-		play = &playerAdapter{r: player.New()}
-	}
-
 	var lock app.Locker
 	if r.opts.NewLock != nil {
 		lock = r.opts.NewLock(paths.LockPath)
@@ -206,10 +219,11 @@ func (r *Root) persistentPreRun(cmd *cobra.Command) error {
 	r.application = &app.App{
 		Store:   st,
 		Feeds:   feeds,
-		Player:  play,
+		Player:  newPlayer(),
 		Lock:    lock,
 		Clock:   r.opts.Clock,
 		DataDir: paths.DataDir,
+		DBPath:  paths.DBPath,
 		Version: r.versionInfo(),
 	}
 	return nil

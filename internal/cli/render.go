@@ -138,17 +138,28 @@ func RenderAdd(w io.Writer, jsonMode bool, r model.AddResult) error {
 	if r.Created {
 		state = "created"
 	}
-	fmt.Fprintf(w, "Podcast %d %s\n", r.Podcast.ID, state)
-	fmt.Fprintf(w, "  Title:    %s\n", r.Podcast.Title)
+	for _, line := range []string{
+		fmt.Sprintf("Podcast %d %s\n", r.Podcast.ID, state),
+		fmt.Sprintf("  Title:    %s\n", r.Podcast.Title),
+	} {
+		if err := writeString(w, line); err != nil {
+			return err
+		}
+	}
 	if r.Podcast.Alias != nil {
-		fmt.Fprintf(w, "  Alias:    %s\n", *r.Podcast.Alias)
+		if err := writeString(w, fmt.Sprintf("  Alias:    %s\n", *r.Podcast.Alias)); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintf(w, "  Feed URL: %s\n", r.Podcast.FeedURL)
+	if err := writeString(w, fmt.Sprintf("  Feed URL: %s\n", r.Podcast.FeedURL)); err != nil {
+		return err
+	}
 	if r.Podcast.ResolvedURL != r.Podcast.FeedURL {
-		fmt.Fprintf(w, "  Resolved: %s\n", r.Podcast.ResolvedURL)
+		if err := writeString(w, fmt.Sprintf("  Resolved: %s\n", r.Podcast.ResolvedURL)); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintf(w, "  Episodes: %d\n", r.EpisodeCount)
-	return nil
+	return writeString(w, fmt.Sprintf("  Episodes: %d\n", r.EpisodeCount))
 }
 
 // RenderList writes list result.
@@ -157,11 +168,12 @@ func RenderList(w io.Writer, jsonMode bool, r model.ListResult) error {
 		return WriteJSON(w, "list", r)
 	}
 	if len(r.Podcasts) == 0 {
-		fmt.Fprintln(w, "No subscriptions.")
-		return nil
+		return writeString(w, "No subscriptions.\n")
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tNAME\tTITLE\tEPISODES\tUNPLAYED\tLAST SUCCESS\tLAST ERROR")
+	if err := writeString(tw, "ID\tNAME\tTITLE\tEPISODES\tUNPLAYED\tLAST SUCCESS\tLAST ERROR\n"); err != nil {
+		return err
+	}
 	for _, p := range r.Podcasts {
 		name := "-"
 		if p.Alias != nil {
@@ -171,9 +183,11 @@ func RenderList(w io.Writer, jsonMode bool, r model.ListResult) error {
 		if p.LastError != nil && *p.LastError != "" {
 			lastErr = truncate(*p.LastError, 40)
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
+		if err := writeString(tw, fmt.Sprintf("%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
 			p.ID, name, p.Title, p.EpisodeCount, p.UnplayedCount,
-			fmtTime(p.LastSuccessAt), lastErr)
+			fmtTime(p.LastSuccessAt), lastErr)); err != nil {
+			return err
+		}
 	}
 	return tw.Flush()
 }
@@ -183,8 +197,7 @@ func RenderRemove(w io.Writer, jsonMode bool, r model.RemoveResult) error {
 	if jsonMode {
 		return WriteJSON(w, "remove", r)
 	}
-	fmt.Fprintf(w, "Removed podcast %d (%s)\n", r.Podcast.ID, podcastLabel(r.Podcast))
-	return nil
+	return writeString(w, fmt.Sprintf("Removed podcast %d (%s)\n", r.Podcast.ID, podcastLabel(r.Podcast)))
 }
 
 // RenderLatest writes latest result.
@@ -194,35 +207,34 @@ func RenderLatest(w io.Writer, jsonMode bool, r model.LatestResult) error {
 	}
 	if len(r.Episodes) == 0 {
 		if r.Partial {
-			fmt.Fprintln(w, "No new episodes. Some feeds failed.")
-		} else {
-			fmt.Fprintln(w, "No new episodes.")
+			return writeString(w, "No new episodes. Some feeds failed.\n")
 		}
-	} else {
-		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tPODCAST\tPUBLISHED\tTITLE")
-		for _, e := range r.Episodes {
-			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n",
-				e.ID, episodePodcastLabel(e), fmtTime(e.PublishedAt), e.Title)
+		return writeString(w, "No new episodes.\n")
+	}
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	if err := writeString(tw, "ID\tPODCAST\tPUBLISHED\tTITLE\n"); err != nil {
+		return err
+	}
+	for _, e := range r.Episodes {
+		if err := writeString(tw, fmt.Sprintf("%d\t%s\t%s\t%s\n",
+			e.ID, episodePodcastLabel(e), fmtTime(e.PublishedAt), e.Title)); err != nil {
+			return err
 		}
-		if err := tw.Flush(); err != nil {
+	}
+	return tw.Flush()
+}
+
+// RenderLatestDiagnostics writes partial-failure notes to stderr.
+func RenderLatestDiagnostics(stderr io.Writer, _ bool, r model.LatestResult) error {
+	if !r.Partial || len(r.Failures) == 0 {
+		return nil
+	}
+	for _, f := range r.Failures {
+		if err := writeString(stderr, fmt.Sprintf("warning: podcast %d: %s\n", f.PodcastID, f.Message)); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// RenderLatestDiagnostics writes partial-failure notes to stderr.
-func RenderLatestDiagnostics(stderr io.Writer, jsonMode bool, r model.LatestResult) {
-	if !r.Partial || len(r.Failures) == 0 {
-		return
-	}
-	if jsonMode {
-		// failures already in JSON body; still emit concise stderr diagnostic
-	}
-	for _, f := range r.Failures {
-		fmt.Fprintf(stderr, "warning: podcast %d: %s\n", f.PodcastID, f.Message)
-	}
 }
 
 // RenderEpisodes writes episodes list.
@@ -231,15 +243,18 @@ func RenderEpisodes(w io.Writer, jsonMode bool, r model.EpisodesResult) error {
 		return WriteJSON(w, "episodes", r)
 	}
 	if len(r.Episodes) == 0 {
-		fmt.Fprintln(w, "No episodes.")
-		return nil
+		return writeString(w, "No episodes.\n")
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tPODCAST\tPUBLISHED\tDURATION\tPLAYED\tTITLE")
+	if err := writeString(tw, "ID\tPODCAST\tPUBLISHED\tDURATION\tPLAYED\tTITLE\n"); err != nil {
+		return err
+	}
 	for _, e := range r.Episodes {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
+		if err := writeString(tw, fmt.Sprintf("%d\t%s\t%s\t%s\t%s\t%s\n",
 			e.ID, episodePodcastLabel(e), fmtTime(e.PublishedAt),
-			fmtDuration(e.DurationSeconds), playedLabel(e), e.Title)
+			fmtDuration(e.DurationSeconds), playedLabel(e), e.Title)); err != nil {
+			return err
+		}
 	}
 	return tw.Flush()
 }
@@ -250,16 +265,23 @@ func RenderEpisode(w io.Writer, jsonMode bool, r model.EpisodeResult) error {
 		return WriteJSON(w, "episode", r)
 	}
 	e := r.Episode
-	fmt.Fprintf(w, "Episode %d\n", e.ID)
-	fmt.Fprintf(w, "  Podcast:     %s (id %d)\n", episodePodcastLabel(e), e.PodcastID)
-	fmt.Fprintf(w, "  Title:       %s\n", e.Title)
-	fmt.Fprintf(w, "  Published:   %s\n", fmtTimeFull(e.PublishedAt))
-	fmt.Fprintf(w, "  Duration:    %s\n", fmtDuration(e.DurationSeconds))
-	fmt.Fprintf(w, "  Played:      %s\n", playedLabel(e))
-	fmt.Fprintf(w, "  Play count:  %d\n", e.PlayCount)
-	fmt.Fprintf(w, "  Media URL:   %s\n", e.EnclosureURL)
+	lines := []string{
+		fmt.Sprintf("Episode %d\n", e.ID),
+		fmt.Sprintf("  Podcast:     %s (id %d)\n", episodePodcastLabel(e), e.PodcastID),
+		fmt.Sprintf("  Title:       %s\n", e.Title),
+		fmt.Sprintf("  Published:   %s\n", fmtTimeFull(e.PublishedAt)),
+		fmt.Sprintf("  Duration:    %s\n", fmtDuration(e.DurationSeconds)),
+		fmt.Sprintf("  Played:      %s\n", playedLabel(e)),
+		fmt.Sprintf("  Play count:  %d\n", e.PlayCount),
+		fmt.Sprintf("  Media URL:   %s\n", e.EnclosureURL),
+	}
 	if e.Description != nil && *e.Description != "" {
-		fmt.Fprintf(w, "  Description: %s\n", strings.TrimSpace(*e.Description))
+		lines = append(lines, fmt.Sprintf("  Description: %s\n", strings.TrimSpace(*e.Description)))
+	}
+	for _, line := range lines {
+		if err := writeString(w, line); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -273,8 +295,7 @@ func RenderMark(w io.Writer, jsonMode bool, r model.MarkResult) error {
 	if r.Episode.IsPlayed() {
 		state = "played"
 	}
-	fmt.Fprintf(w, "Episode %d marked %s\n", r.Episode.ID, state)
-	return nil
+	return writeString(w, fmt.Sprintf("Episode %d marked %s\n", r.Episode.ID, state))
 }
 
 // RenderPlay writes play result.
@@ -282,9 +303,11 @@ func RenderPlay(w io.Writer, jsonMode bool, r model.PlayResult) error {
 	if jsonMode {
 		return WriteJSON(w, "play", r)
 	}
-	fmt.Fprintf(w, "Played episode %d with %s\n", r.Episode.ID, r.Player)
+	if err := writeString(w, fmt.Sprintf("Played episode %d with %s\n", r.Episode.ID, r.Player)); err != nil {
+		return err
+	}
 	if r.Marked {
-		fmt.Fprintln(w, "Marked as played.")
+		return writeString(w, "Marked as played.\n")
 	}
 	return nil
 }
@@ -294,16 +317,18 @@ func RenderDoctor(w io.Writer, jsonMode bool, r model.DoctorResult) error {
 	if jsonMode {
 		return WriteJSON(w, "doctor", r)
 	}
-	fmt.Fprintf(w, "Data directory: %s\n", r.DataDir)
+	if err := writeString(w, fmt.Sprintf("Data directory: %s\n", r.DataDir)); err != nil {
+		return err
+	}
 	for _, c := range r.Checks {
-		fmt.Fprintf(w, "  [%s] %s: %s\n", strings.ToUpper(c.Status), c.Name, c.Message)
+		if err := writeString(w, fmt.Sprintf("  [%s] %s: %s\n", strings.ToUpper(c.Status), c.Name, c.Message)); err != nil {
+			return err
+		}
 	}
 	if r.OK {
-		fmt.Fprintln(w, "OK")
-	} else {
-		fmt.Fprintln(w, "FAILED")
+		return writeString(w, "OK\n")
 	}
-	return nil
+	return writeString(w, "FAILED\n")
 }
 
 // RenderVersion writes version info.
@@ -311,12 +336,23 @@ func RenderVersion(w io.Writer, jsonMode bool, v model.VersionInfo) error {
 	if jsonMode {
 		return WriteJSON(w, "version", v)
 	}
-	fmt.Fprintf(w, "pcast %s\n", v.Version)
-	fmt.Fprintf(w, "  commit:     %s\n", v.Commit)
-	fmt.Fprintf(w, "  built:      %s\n", v.BuildDate)
-	fmt.Fprintf(w, "  go:         %s\n", v.GoVersion)
-	fmt.Fprintf(w, "  os/arch:    %s/%s\n", v.OS, v.Arch)
+	for _, line := range []string{
+		fmt.Sprintf("pcast %s\n", v.Version),
+		fmt.Sprintf("  commit:     %s\n", v.Commit),
+		fmt.Sprintf("  built:      %s\n", v.BuildDate),
+		fmt.Sprintf("  go:         %s\n", v.GoVersion),
+		fmt.Sprintf("  os/arch:    %s/%s\n", v.OS, v.Arch),
+	} {
+		if err := writeString(w, line); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func writeString(w io.Writer, s string) error {
+	_, err := io.WriteString(w, s)
+	return err
 }
 
 func truncate(s string, n int) string {

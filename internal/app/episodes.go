@@ -99,11 +99,16 @@ func (a *App) Play(ctx context.Context, idStr string, opts model.PlaybackOpts) (
 		}, err
 	}
 
+	// Platform openers: successful hand-off marks played (project contract); completion is unobservable.
 	marked := false
 	if !opts.NoMarkPlayed {
 		err = a.locker().WithLock(ctx, func(ctx context.Context) error {
 			updated, err := a.Store.RecordPlayback(ctx, id, a.now())
 			if err != nil {
+				// Episode removed during playback: treat listen as success without mark.
+				if model.CodeOf(err) == model.CodeNotFound {
+					return nil
+				}
 				return err
 			}
 			ep = updated

@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -70,6 +71,26 @@ func TestResolvePathsXDG(t *testing.T) {
 	}
 	if p.DataDir != filepath.Join("/xdg/data", "pcast") {
 		t.Fatalf("got %s", p.DataDir)
+	}
+}
+
+func TestEnsureDataDirTightensExisting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix directory permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDataDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("permissions=%o want 700", got)
 	}
 }
 

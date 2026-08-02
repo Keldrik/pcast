@@ -83,5 +83,17 @@ func EnsureDataDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create data directory %s: %w", dir, err)
 	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat data directory %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("data path %s is not a directory", dir)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("protect data directory %s: %w", dir, err)
+		}
+	}
 	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/Keldrik/pcast/internal/cli"
@@ -54,9 +53,12 @@ func run(args []string) int {
 	if cli.IsPartial(err) {
 		return model.ExitPartialLatest
 	}
+	if cli.IsDoctorFailure(err) {
+		return model.ExitStorage
+	}
 
 	// Map plain cobra usage errors into typed invalid_argument.
-	if !isTyped(err) && isCobraUsage(err) {
+	if !isTyped(err) && cli.IsCobraUsage(err) {
 		err = model.InvalidArgument(err.Error())
 	}
 
@@ -79,33 +81,4 @@ func hasJSONFlag(args []string) bool {
 func isTyped(err error) bool {
 	var ae *model.Error
 	return errors.As(err, &ae)
-}
-
-func isCobraUsage(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	switch {
-	case strings.HasPrefix(msg, "unknown command"):
-		return true
-	case strings.HasPrefix(msg, "unknown flag"):
-		return true
-	case strings.HasPrefix(msg, "invalid argument"):
-		return true
-	case strings.Contains(msg, "accepts "):
-		return true
-	case strings.Contains(msg, "requires "):
-		return true
-	case strings.Contains(msg, "required flag"):
-		return true
-	case errors.Is(err, context.Canceled):
-		return false
-	default:
-		// Flag parse errors etc.
-		if strings.Contains(msg, "flag") || strings.Contains(msg, "arg") {
-			return true
-		}
-		return false
-	}
 }

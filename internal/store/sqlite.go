@@ -3,7 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,24 +20,36 @@ type Store struct {
 
 // Open opens (or creates) the database at path, configures SQLite, and migrates.
 func Open(ctx context.Context, path string) (*Store, error) {
-	// modernc driver; _pragma query params applied per-connection via DSN.
-	dsn := path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	// Encode the filesystem path before adding SQLite URI parameters. Raw paths
+	// may contain '?' or '#', both of which otherwise change the DSN meaning.
+	dsn := sqliteDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, model.Storage("open database", err)
 	}
-	db.SetMaxOpenConns(1) // SQLite write safety; WAL still allows concurrent readers via same conn pool carefully
+	// Single connection: app lock serializes writers; avoids multi-conn write races on one file.
+	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
 
-	if err := db.PingContext(ctx); err != nil {
+	if err := retrySQLite(ctx, func() error { return db.PingContext(ctx) }); err != nil {
 		_ = db.Close()
 		return nil, model.Storage("ping database", err)
 	}
 
-	// Ensure foreign keys on this connection (DSN pragma is best-effort across drivers).
-	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
-		_ = db.Close()
-		return nil, model.Storage("enable foreign keys", err)
+	// Apply the pragmas after opening. Busy timeout must be configured before
+	// journal_mode so concurrent first opens wait instead of failing at Ping.
+	for _, pragma := range []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA foreign_keys = ON`,
+		`PRAGMA journal_mode = WAL`,
+	} {
+		if err := retrySQLite(ctx, func() error {
+			_, err := db.ExecContext(ctx, pragma)
+			return err
+		}); err != nil {
+			_ = db.Close()
+			return nil, model.Storage("configure sqlite", err)
+		}
 	}
 
 	s := &Store{db: db}
@@ -66,6 +79,37 @@ func (s *Store) Close() error {
 // DB exposes the underlying *sql.DB for doctor checks.
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+func sqliteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+}
+
+func retrySQLite(ctx context.Context, fn func() error) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := fn()
+		if err == nil || !isSQLiteBusy(err) {
+			return err
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return err
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteBusy(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "sqlite_busy")
 }
 
 // ForeignKeysEnabled reports whether PRAGMA foreign_keys is on.
@@ -102,6 +146,13 @@ func formatTimePtr(t *time.Time) any {
 		return nil
 	}
 	return formatTime(*t)
+}
+
+func formatTimeNanosPtr(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().UnixNano()
 }
 
 func parseTime(s string) (time.Time, error) {
@@ -171,7 +222,6 @@ func scanNullInt64(ns sql.NullInt64) *int64 {
 	return &v
 }
 
-// clockNow is overridable in tests via Store methods receiving now from callers.
 func fmtErr(op string, err error) error {
 	if err == nil {
 		return nil
@@ -186,6 +236,3 @@ func fmtErr(op string, err error) error {
 	}
 	return model.Storage(op, err)
 }
-
-// quoteIdent is unused; kept for clarity that SQL identifiers are never user-sourced.
-var _ = fmt.Sprintf

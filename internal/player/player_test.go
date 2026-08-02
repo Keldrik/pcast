@@ -128,6 +128,18 @@ func TestMissingPlayer(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsMissingConfiguredPath(t *testing.T) {
+	r := player.New()
+	r.LookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	r.Getenv = func(string) string { return "/missing/player" }
+	if _, err := r.Resolve("", nil); model.CodeOf(err) != model.CodePlayerUnavailable {
+		t.Fatalf("err=%v code=%s", err, model.CodeOf(err))
+	}
+	if _, err := r.Resolve("/missing/player", nil); model.CodeOf(err) != model.CodePlayerUnavailable {
+		t.Fatalf("explicit err=%v code=%s", err, model.CodeOf(err))
+	}
+}
+
 func TestHostileArgs(t *testing.T) {
 	truePath, err := exec.LookPath("true")
 	if err != nil {
@@ -156,12 +168,17 @@ func TestHostileArgs(t *testing.T) {
 func TestLookPathExplicitRelative(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "myplayer")
-	// create empty file - resolve should accept path with separator even if look fails
+	// create an executable path and make the injected lookup confirm it.
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := player.New()
-	r.LookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	r.LookPath = func(name string) (string, error) {
+		if name == bin {
+			return bin, nil
+		}
+		return "", exec.ErrNotFound
+	}
 	res, err := r.Resolve(bin, nil)
 	if err != nil || res.Path != bin {
 		t.Fatalf("%+v err=%v", res, err)

@@ -80,13 +80,8 @@ func (r *Runner) Resolve(explicit string, extraArgs []string) (ResolveResult, er
 	}
 
 	if explicit != "" {
-		// Allow path or bare name.
 		path, err := look(explicit)
 		if err != nil {
-			// If it looks like a path, use directly when absolute/relative.
-			if strings.Contains(explicit, string(os.PathSeparator)) || strings.HasPrefix(explicit, ".") {
-				return ResolveResult{Path: explicit, Args: append([]string{}, extraArgs...), Name: explicit}, nil
-			}
 			return ResolveResult{}, model.PlayerUnavailable(fmt.Sprintf("player %q not found", explicit))
 		}
 		return ResolveResult{Path: path, Args: append([]string{}, extraArgs...), Name: explicit}, nil
@@ -95,9 +90,6 @@ func (r *Runner) Resolve(explicit string, extraArgs []string) (ResolveResult, er
 	if env := strings.TrimSpace(getenv("PCAST_PLAYER")); env != "" {
 		path, err := look(env)
 		if err != nil {
-			if strings.Contains(env, string(os.PathSeparator)) || strings.HasPrefix(env, ".") {
-				return ResolveResult{Path: env, Args: append([]string{}, extraArgs...), Name: env}, nil
-			}
 			return ResolveResult{}, model.PlayerUnavailable(fmt.Sprintf("PCAST_PLAYER %q not found", env))
 		}
 		return ResolveResult{Path: path, Args: append([]string{}, extraArgs...), Name: env}, nil

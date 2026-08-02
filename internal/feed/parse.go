@@ -24,6 +24,12 @@ func MapFeed(gf *gofeed.Feed, submitted, resolved string, httpStatus int, etag, 
 	if title == "" {
 		return model.ParsedFeed{}, model.InvalidFeed("feed title is required", nil)
 	}
+	// Relative enclosures are relative to the final feed response URL, not
+	// channel <link>, which normally points at the show's homepage.
+	base := resolved
+	if base == "" {
+		base = submitted
+	}
 	out := model.ParsedFeed{
 		SubmittedURL: submitted,
 		ResolvedURL:  resolved,
@@ -39,7 +45,7 @@ func MapFeed(gf *gofeed.Feed, submitted, resolved string, httpStatus int, etag, 
 		if item == nil {
 			continue
 		}
-		ep, ok := mapItem(item)
+		ep, ok := mapItem(item, base)
 		if !ok {
 			continue
 		}
@@ -51,8 +57,8 @@ func MapFeed(gf *gofeed.Feed, submitted, resolved string, httpStatus int, etag, 
 	return out, nil
 }
 
-func mapItem(item *gofeed.Item) (model.ParsedEpisode, bool) {
-	encURL, mediaType, mediaLen := selectEnclosure(item)
+func mapItem(item *gofeed.Item, baseURL string) (model.ParsedEpisode, bool) {
+	encURL, mediaType, mediaLen := selectEnclosure(item, baseURL)
 	if encURL == "" {
 		return model.ParsedEpisode{}, false
 	}
@@ -91,7 +97,7 @@ func mapItem(item *gofeed.Item) (model.ParsedEpisode, bool) {
 	}, true
 }
 
-func selectEnclosure(item *gofeed.Item) (encURL string, mediaType *string, mediaLen *int64) {
+func selectEnclosure(item *gofeed.Item, baseURL string) (encURL string, mediaType *string, mediaLen *int64) {
 	type cand struct {
 		url   string
 		typ   string
@@ -103,22 +109,20 @@ func selectEnclosure(item *gofeed.Item) (encURL string, mediaType *string, media
 		if e == nil {
 			continue
 		}
-		u := strings.TrimSpace(e.URL)
+		u := resolveMediaURL(strings.TrimSpace(e.URL), baseURL)
 		if u == "" {
 			continue
 		}
-		// Resolve relative URLs are uncommon; require absolute http(s).
-		if norm, err := NormalizeURL(u); err == nil {
-			u = norm
-		} else if !IsHTTPURL(u) {
-			continue
-		}
-		typ := strings.TrimSpace(strings.ToLower(e.Type))
+		typ := strings.TrimSpace(strings.ToLower(strings.SplitN(e.Type, ";", 2)[0]))
 		var length int64
 		if e.Length != "" {
 			if n, err := strconv.ParseInt(e.Length, 10, 64); err == nil {
 				length = n
 			}
+		}
+		audioURL := hasAudioExtension(u)
+		if !strings.HasPrefix(typ, "audio/") && !audioURL && hasNonAudioExtension(u) {
+			continue
 		}
 		score := 0
 		switch {
@@ -126,31 +130,22 @@ func selectEnclosure(item *gofeed.Item) (encURL string, mediaType *string, media
 			score = 100
 		case typ == "" || typ == "application/octet-stream":
 			score = 50
-		case strings.HasPrefix(typ, "video/"):
-			score = 20
+		case audioURL:
+			// Some feeds label audio as application/* or text/*. Keep it only
+			// when the URL provides independent audio evidence.
+			score = 40
 		default:
-			score = 10
+			continue
 		}
-		// Prefer known audio extensions slightly.
-		lower := strings.ToLower(u)
-		for _, ext := range []string{".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav"} {
-			if strings.Contains(lower, ext) {
-				score += 5
-				break
-			}
+		if audioURL {
+			score += 5
 		}
 		cands = append(cands, cand{url: u, typ: typ, len: length, score: score})
 	}
 	// Also consider media extensions on link when no enclosure.
 	if len(cands) == 0 && item.Link != "" {
-		if norm, err := NormalizeURL(item.Link); err == nil {
-			lower := strings.ToLower(norm)
-			for _, ext := range []string{".mp3", ".m4a", ".aac", ".ogg", ".opus"} {
-				if strings.HasSuffix(lower, ext) || strings.Contains(lower, ext+"?") {
-					cands = append(cands, cand{url: norm, score: 40})
-					break
-				}
-			}
+		if norm := resolveMediaURL(item.Link, baseURL); norm != "" && hasAudioExtension(norm) {
+			cands = append(cands, cand{url: norm, score: 40})
 		}
 	}
 	if len(cands) == 0 {
@@ -261,22 +256,72 @@ func RedactURL(raw string) string {
 	if u.User != nil {
 		u.User = nil
 	}
-	// Keep keys but blank values for common secret-ish params.
-	q := u.Query()
-	changed := false
-	for _, k := range []string{"token", "key", "api_key", "apikey", "auth", "password", "secret", "access_token"} {
-		if q.Has(k) {
-			q.Set(k, "REDACTED")
-			changed = true
-		}
+	// Omit the entire query. Feed URLs are user-controlled and a private
+	// parameter can use any name, casing, or malformed encoding.
+	if u.RawQuery != "" {
+		u.RawQuery = "REDACTED"
 	}
-	if changed {
-		u.RawQuery = q.Encode()
-	}
+	u.Fragment = ""
 	return u.String()
 }
 
 // FormatBytes is a tiny helper for error messages.
 func FormatBytes(n int64) string {
 	return fmt.Sprintf("%d bytes", n)
+}
+
+// resolveMediaURL normalizes absolute http(s) URLs or resolves relative ones against baseURL.
+func resolveMediaURL(raw, baseURL string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if norm, err := NormalizeURL(raw); err == nil {
+		return norm
+	}
+	if baseURL == "" {
+		return ""
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	abs := base.ResolveReference(ref).String()
+	norm, err := NormalizeURL(abs)
+	if err != nil {
+		return ""
+	}
+	return norm
+}
+
+func hasNonAudioExtension(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(u.Path)
+	for _, ext := range []string{".html", ".htm", ".xml", ".json", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".mp4", ".webm"} {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAudioExtension(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(u.Path)
+	for _, ext := range []string{".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac"} {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
 }

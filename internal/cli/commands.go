@@ -96,15 +96,15 @@ func (r *Root) cmdLatest() *cobra.Command {
 			if len(args) == 1 {
 				selector = args[0]
 			}
-			var writeErr error
 			res, err := a.LatestLocked(cmd.Context(), selector, func(result model.LatestResult) error {
-				writeErr = RenderLatest(r.opts.Stdout, r.jsonOut, result)
-				return writeErr
+				return RenderLatest(r.opts.Stdout, r.jsonOut, result)
 			})
 			if err != nil {
 				return err
 			}
-			RenderLatestDiagnostics(r.opts.Stderr, r.jsonOut, res)
+			if err := RenderLatestDiagnostics(r.opts.Stderr, r.jsonOut, res); err != nil {
+				return model.Internal("write latest diagnostics", err)
+			}
 			if res.Partial {
 				// Successful partial: output already written and acknowledged.
 				// Return a typed error so main exits 4, but stdout already has data.
@@ -281,12 +281,19 @@ func (r *Root) cmdDoctor() *cobra.Command {
 				return err
 			}
 			if !res.OK {
-				return model.Storage("doctor found problems", nil)
+				// The structured report is the result; signal the documented exit
+				// status without emitting a second error document.
+				return &doctorFailure{}
 			}
 			return nil
 		},
 	}
 }
+
+type doctorFailure struct{}
+
+func (e *doctorFailure) Error() string { return "doctor checks failed" }
+func (e *doctorFailure) ExitCode() int { return model.ExitStorage }
 
 // ExitCode maps an error to a process exit status, including partial latest.
 func ExitCode(err error) int {
@@ -296,6 +303,9 @@ func ExitCode(err error) int {
 	if IsPartial(err) {
 		return model.ExitPartialLatest
 	}
+	if IsDoctorFailure(err) {
+		return model.ExitStorage
+	}
 	if _, ok := err.(*strconv.NumError); ok {
 		return model.ExitUsage
 	}
@@ -303,13 +313,15 @@ func ExitCode(err error) int {
 	if errors.As(err, &ae) {
 		return model.ExitCode(err)
 	}
-	if isCobraUsage(err) {
+	if IsCobraUsage(err) {
 		return model.ExitUsage
 	}
 	return model.ExitCode(err)
 }
 
-func isCobraUsage(err error) bool {
+// IsCobraUsage reports cobra/flag parse errors that should exit 2.
+// Kept narrow: broad substring matches on "arg"/"flag" mis-classify real failures.
+func IsCobraUsage(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -317,12 +329,17 @@ func isCobraUsage(err error) bool {
 	switch {
 	case strings.HasPrefix(msg, "unknown command"),
 		strings.HasPrefix(msg, "unknown flag"),
+		strings.HasPrefix(msg, "bad flag"),
 		strings.HasPrefix(msg, "invalid argument"),
-		strings.Contains(msg, "accepts "),
-		strings.Contains(msg, "requires "),
+		strings.HasPrefix(msg, "accepts "),
+		strings.Contains(msg, "accepts at most"),
+		strings.Contains(msg, "accepts between"),
+		strings.Contains(msg, "requires at least"),
+		strings.Contains(msg, "requires one of"),
 		strings.Contains(msg, "required flag"),
-		strings.Contains(msg, "flag"),
-		strings.Contains(msg, "arg"):
+		strings.HasPrefix(msg, "flag needs"),
+		strings.HasPrefix(msg, "flag redefined"),
+		strings.Contains(msg, "unknown shorthand flag"):
 		return true
 	default:
 		return false
@@ -330,7 +347,14 @@ func isCobraUsage(err error) bool {
 }
 
 // IsPartial reports whether err is a partial-latest sentinel.
+// Callers must consume stdout on exit 4 when this is true (success-shaped body).
 func IsPartial(err error) bool {
 	var pe *partialError
 	return errors.As(err, &pe)
+}
+
+// IsDoctorFailure reports a rendered doctor result that requires exit 5.
+func IsDoctorFailure(err error) bool {
+	var de *doctorFailure
+	return errors.As(err, &de)
 }

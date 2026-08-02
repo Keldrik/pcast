@@ -48,16 +48,10 @@ func runCLI(t *testing.T, dataDir string, args ...string) (stdout, stderr string
 	defer func() { _ = cleanup() }()
 	root.SetArgs(append([]string{"--data-dir", dataDir}, args...))
 	err := root.ExecuteContext(context.Background())
-	if err != nil && !cli.IsPartial(err) {
+	if err != nil && !cli.IsPartial(err) && !cli.IsDoctorFailure(err) {
 		// Map plain cobra usage errors like main does.
-		if model.CodeOf(err) == model.CodeInternalError || model.ExitCode(err) == model.ExitInternal {
-			if _, ok := err.(*model.Error); !ok {
-				msg := err.Error()
-				if strings.HasPrefix(msg, "unknown command") || strings.HasPrefix(msg, "unknown flag") ||
-					strings.Contains(msg, "accepts ") || strings.Contains(msg, "flag") {
-					err = model.InvalidArgument(msg)
-				}
-			}
+		if _, ok := err.(*model.Error); !ok && cli.IsCobraUsage(err) {
+			err = model.InvalidArgument(err.Error())
 		}
 		jsonMode := false
 		for _, a := range args {
@@ -170,6 +164,108 @@ func TestVersionAndHelp(t *testing.T) {
 	_, errb, exit = runCLI(t, dir, "nope")
 	if exit != model.ExitUsage {
 		t.Fatalf("exit=%d stderr=%s", exit, errb)
+	}
+}
+
+func TestDoctorReportsInitializationFailure(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "not-a-directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, errb, exit := runCLI(t, file.Name(), "--json", "doctor")
+	if exit != model.ExitStorage || errb != "" {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, out, errb)
+	}
+	var env struct {
+		Command string             `json:"command"`
+		Data    model.DoctorResult `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Command != "doctor" || env.Data.OK || len(env.Data.Checks) < 3 {
+		t.Fatalf("doctor=%+v", env.Data)
+	}
+}
+
+func TestDoctorReportsCorruptDatabase(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pcast.db"), []byte("not sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, errb, exit := runCLI(t, dir, "--json", "doctor")
+	if exit != model.ExitStorage || errb != "" {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, out, errb)
+	}
+	var env struct {
+		Data model.DoctorResult `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.OK || len(env.Data.Checks) < 3 {
+		t.Fatalf("doctor=%+v", env.Data)
+	}
+}
+
+func TestDuplicateAddAliasConflict(t *testing.T) {
+	dir := t.TempDir()
+	srv := feedServer(t, readFixture(t, "rss_basic.xml"))
+	defer srv.Close()
+	if _, errb, exit := runCLI(t, dir, "add", srv.URL+"/feed.xml", "--name", "first"); exit != 0 {
+		t.Fatalf("first add exit=%d err=%s", exit, errb)
+	}
+	other := feedServer(t, readFixture(t, "rss_basic.xml"))
+	defer other.Close()
+	if _, errb, exit := runCLI(t, dir, "add", other.URL+"/feed.xml", "--name", "second"); exit != 0 {
+		t.Fatalf("second add exit=%d err=%s", exit, errb)
+	}
+	_, errb, exit := runCLI(t, dir, "add", srv.URL+"/feed.xml", "--name", "second")
+	if exit != model.ExitUsage || !strings.Contains(errb, "already in use") {
+		t.Fatalf("exit=%d err=%s", exit, errb)
+	}
+}
+
+func TestLatestDoesNotExposeFeedQueryValues(t *testing.T) {
+	dir := t.TempDir()
+	var failed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failed {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = io.WriteString(w, readFixture(t, "rss_empty.xml"))
+	}))
+	defer srv.Close()
+	url := srv.URL + "/feed.xml?Token=SECRET&private=ALSO_SECRET"
+	if _, errb, exit := runCLI(t, dir, "add", url); exit != 0 {
+		t.Fatalf("add exit=%d err=%s", exit, errb)
+	}
+	failed = true
+	out, errb, exit := runCLI(t, dir, "--json", "latest")
+	if exit != model.ExitPartialLatest {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, out, errb)
+	}
+	if strings.Contains(out+errb, "SECRET") || strings.Contains(out+errb, "ALSO_SECRET") {
+		t.Fatalf("query value leaked: stdout=%s stderr=%s", out, errb)
+	}
+	out, errb, exit = runCLI(t, dir, "--json", "list")
+	if exit != 0 || errb != "" {
+		t.Fatalf("list: exit=%d stdout=%s stderr=%s", exit, out, errb)
+	}
+	var listed struct {
+		Data model.ListResult `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Data.Podcasts) != 1 || listed.Data.Podcasts[0].LastError == nil ||
+		strings.Contains(*listed.Data.Podcasts[0].LastError, "SECRET") ||
+		strings.Contains(*listed.Data.Podcasts[0].LastError, "ALSO_SECRET") {
+		t.Fatalf("stored error leaked: %+v", listed.Data.Podcasts)
 	}
 }
 

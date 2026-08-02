@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -94,12 +93,12 @@ func upsertEpisodesTx(ctx context.Context, tx *sql.Tx, podcastID int64, items []
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO episodes (
-				podcast_id, identity_key, guid, title, description, published_at,
+				podcast_id, identity_key, guid, title, description, published_at, published_at_ns,
 				duration_seconds, enclosure_url, media_type, media_length,
 				first_seen_at, updated_at, announced_at, played_at, play_count, last_played_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL)`,
 			podcastID, item.IdentityKey, nullString(item.GUID), item.Title, nullString(item.Description),
-			formatTimePtr(item.PublishedAt), nullInt(item.DurationSeconds), item.EnclosureURL,
+			formatTimePtr(item.PublishedAt), formatTimeNanosPtr(item.PublishedAt), nullInt(item.DurationSeconds), item.EnclosureURL,
 			nullString(item.MediaType), nullInt64(item.MediaLength),
 			nowS, nowS,
 		)
@@ -139,7 +138,7 @@ func findEpisodeMatch(ctx context.Context, tx *sql.Tx, podcastID int64, item Bas
 	// 3. enclosure URL
 	row = tx.QueryRowContext(ctx, `
 		SELECT `+episodeSelectCols+` FROM episodes e
-		WHERE e.podcast_id = ? AND e.enclosure_url = ?`, podcastID, item.EnclosureURL)
+		WHERE e.podcast_id = ? AND e.enclosure_url = ? COLLATE BINARY`, podcastID, item.EnclosureURL)
 	ep, err = scanEpisode(row)
 	if err == nil {
 		return ep, true, nil
@@ -151,25 +150,26 @@ func findEpisodeMatch(ctx context.Context, tx *sql.Tx, podcastID int64, item Bas
 }
 
 func updateEpisodeMeta(ctx context.Context, tx *sql.Tx, id int64, item BaselineEpisode, nowS string) error {
-	// Preserve useful stored values when feed omits fields (COALESCE with existing via CASE).
+	// identity_key is stable once assigned — rewriting it can UNIQUE-collide with another row.
+	// Preserve useful stored values when feed omits fields (COALESCE / CASE).
 	_, err := tx.ExecContext(ctx, `
 		UPDATE episodes SET
-			identity_key = ?,
 			guid = COALESCE(?, guid),
 			title = CASE WHEN ? != '' THEN ? ELSE title END,
 			description = COALESCE(?, description),
 			published_at = COALESCE(?, published_at),
+			published_at_ns = COALESCE(?, published_at_ns),
 			duration_seconds = COALESCE(?, duration_seconds),
 			enclosure_url = CASE WHEN ? != '' THEN ? ELSE enclosure_url END,
 			media_type = COALESCE(?, media_type),
 			media_length = COALESCE(?, media_length),
 			updated_at = ?
 		WHERE id = ?`,
-		item.IdentityKey,
 		nullString(item.GUID),
 		item.Title, item.Title,
 		nullString(item.Description),
 		formatTimePtr(item.PublishedAt),
+		formatTimeNanosPtr(item.PublishedAt),
 		nullInt(item.DurationSeconds),
 		item.EnclosureURL, item.EnclosureURL,
 		nullString(item.MediaType),
@@ -179,7 +179,8 @@ func updateEpisodeMeta(ctx context.Context, tx *sql.Tx, id int64, item BaselineE
 	return fmtErr("update episode meta", err)
 }
 
-// ListPendingEpisodes returns unannounced episodes, optionally scoped to a podcast.
+// ListPendingEpisodes returns all unannounced episodes (including leftovers from a
+// prior failed latest ack), optionally scoped to a podcast.
 func (s *Store) ListPendingEpisodes(ctx context.Context, podcastID *int64) ([]model.Episode, error) {
 	q := `
 		SELECT ` + episodeSelectCols + `, p.alias, p.title
@@ -191,7 +192,7 @@ func (s *Store) ListPendingEpisodes(ctx context.Context, podcastID *int64) ([]mo
 		q += ` AND e.podcast_id = ?`
 		args = append(args, *podcastID)
 	}
-	q += ` ORDER BY e.podcast_id ASC, e.published_at DESC, e.id ASC`
+	q += ` ORDER BY e.podcast_id ASC, (e.published_at_ns IS NULL) ASC, e.published_at_ns DESC, e.id ASC`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, model.Storage("list pending", err)
@@ -266,7 +267,7 @@ func (s *Store) QueryEpisodes(ctx context.Context, f model.EpisodeFilter) ([]mod
 	}
 	// Stable catalog order: published DESC NULLS LAST, id DESC.
 	// SQLite sorts NULL as smallest by default for DESC we need NULLS LAST emulation.
-	b.WriteString(` ORDER BY (e.published_at IS NULL) ASC, e.published_at DESC, e.id DESC`)
+	b.WriteString(` ORDER BY (e.published_at_ns IS NULL) ASC, e.published_at_ns DESC, e.id DESC`)
 	limit := f.EffectiveLimit()
 	if limit > 0 {
 		b.WriteString(` LIMIT ?`)
@@ -410,9 +411,24 @@ func (s *Store) RecordPlayback(ctx context.Context, id int64, now time.Time) (mo
 }
 
 // ApplyCheck applies a successful feed check: metadata, validators, and episode upserts.
+// resolved_url is updated only when it does not collide with another podcast's URL.
 func (s *Store) ApplyCheck(ctx context.Context, podcastID int64, resolvedURL string, title string, author, desc, etag, lastMod *string, httpStatus int, items []BaselineEpisode, now time.Time) (newCount int, err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		nowS := formatTime(now.UTC())
+		resolved := resolvedURL
+		if resolved != "" {
+			var other int64
+			err := tx.QueryRowContext(ctx, `
+				SELECT id FROM podcasts
+				WHERE id != ? AND (feed_url = ? COLLATE BINARY OR resolved_url = ? COLLATE BINARY)
+				LIMIT 1`, podcastID, resolved, resolved).Scan(&other)
+			if err == nil {
+				// Keep existing resolved_url rather than violating uniqueness / stealing another feed.
+				resolved = ""
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return model.Storage("check resolved url conflict", err)
+			}
+		}
 		_, err := tx.ExecContext(ctx, `
 			UPDATE podcasts SET
 				last_attempt_at = ?,
@@ -431,7 +447,7 @@ func (s *Store) ApplyCheck(ctx context.Context, podcastID int64, resolvedURL str
 			nullString(etag), nullString(lastMod),
 			title, title,
 			nullString(author), nullString(desc),
-			resolvedURL, resolvedURL,
+			resolved, resolved,
 			nowS, podcastID,
 		)
 		if err != nil {
@@ -470,6 +486,3 @@ func (s *Store) ApplyCheckFailure(ctx context.Context, podcastID int64, httpStat
 		WHERE id = ?`, nowS, nullInt(httpStatus), errMsg, nowS, podcastID)
 	return fmtErr("apply check failure", err)
 }
-
-// Debug helper suppress unused.
-var _ = fmt.Sprintf

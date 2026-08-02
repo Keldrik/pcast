@@ -90,6 +90,23 @@ func (s *Store) CreatePodcastWithBaseline(ctx context.Context, in CreatePodcastI
 	var count int
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		now := in.Now.UTC()
+		// Reject feed/resolved collisions against either column of any existing row.
+		// Scheme and host are normalized by the feed layer; path/query bytes remain
+		// case-sensitive and must use binary comparison here.
+		var conflict int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT id FROM podcasts
+			WHERE feed_url = ? COLLATE BINARY OR resolved_url = ? COLLATE BINARY
+			   OR feed_url = ? COLLATE BINARY OR resolved_url = ? COLLATE BINARY
+			LIMIT 1`,
+			in.FeedURL, in.FeedURL, in.ResolvedURL, in.ResolvedURL,
+		).Scan(&conflict)
+		if err == nil {
+			return model.Storage("insert podcast: unique constraint", nil)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return model.Storage("check podcast url conflict", err)
+		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO podcasts (
 				feed_url, resolved_url, alias, title, author, description,
@@ -110,15 +127,15 @@ func (s *Store) CreatePodcastWithBaseline(ctx context.Context, in CreatePodcastI
 			return model.Storage("podcast id", err)
 		}
 		announced := formatTime(now)
-		for _, ep := range in.Episodes {
+		for _, ep := range dedupeBaselineEpisodes(in.Episodes) {
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO episodes (
-					podcast_id, identity_key, guid, title, description, published_at,
+					podcast_id, identity_key, guid, title, description, published_at, published_at_ns,
 					duration_seconds, enclosure_url, media_type, media_length,
 					first_seen_at, updated_at, announced_at, played_at, play_count, last_played_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)`,
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)`,
 				id, ep.IdentityKey, nullString(ep.GUID), ep.Title, nullString(ep.Description),
-				formatTimePtr(ep.PublishedAt), nullInt(ep.DurationSeconds), ep.EnclosureURL,
+				formatTimePtr(ep.PublishedAt), formatTimeNanosPtr(ep.PublishedAt), nullInt(ep.DurationSeconds), ep.EnclosureURL,
 				nullString(ep.MediaType), nullInt64(ep.MediaLength),
 				formatTime(now), formatTime(now), announced,
 			)
@@ -132,15 +149,19 @@ func (s *Store) CreatePodcastWithBaseline(ctx context.Context, in CreatePodcastI
 		if err != nil {
 			return model.Storage("reload podcast", err)
 		}
+		out.EpisodeCount = count
+		out.UnplayedCount = count // baseline is unplayed
 		return nil
 	})
 	return out, count, err
 }
 
-// GetPodcastByID returns a podcast by local ID.
+// GetPodcastByID returns a podcast by local ID with episode counts.
 func (s *Store) GetPodcastByID(ctx context.Context, id int64) (model.Podcast, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+podcastSelectCols+` FROM podcasts p WHERE p.id = ?`, id)
-	p, err := scanPodcast(row)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+podcastSelectCols+podcastCountCols+`
+		FROM podcasts p WHERE p.id = ?`, id)
+	p, err := scanPodcastWithCounts(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, model.NotFoundf("no podcast with id %d", id)
 	}
@@ -150,13 +171,62 @@ func (s *Store) GetPodcastByID(ctx context.Context, id int64) (model.Podcast, er
 	return p, nil
 }
 
+func scanPodcastWithCounts(scanner interface {
+	Scan(dest ...any) error
+}) (model.Podcast, error) {
+	var p model.Podcast
+	var alias, author, desc, etag, lastMod, lastAttempt, lastSuccess, lastErr sql.NullString
+	var lastHTTP sql.NullInt64
+	var created, updated string
+	var epCount, unplayed int
+	err := scanner.Scan(
+		&p.ID, &p.FeedURL, &p.ResolvedURL, &alias, &p.Title, &author, &desc,
+		&etag, &lastMod, &lastAttempt, &lastSuccess, &lastHTTP,
+		&lastErr, &created, &updated, &epCount, &unplayed,
+	)
+	if err != nil {
+		return p, err
+	}
+	p.Alias = scanNullString(alias)
+	p.Author = scanNullString(author)
+	p.Description = scanNullString(desc)
+	p.ETag = scanNullString(etag)
+	p.LastModified = scanNullString(lastMod)
+	p.LastError = scanNullString(lastErr)
+	if lastHTTP.Valid {
+		v := int(lastHTTP.Int64)
+		p.LastHTTPStatus = &v
+	}
+	var err2 error
+	if p.LastAttemptAt, err2 = scanTimePtr(lastAttempt); err2 != nil {
+		return p, err2
+	}
+	if p.LastSuccessAt, err2 = scanTimePtr(lastSuccess); err2 != nil {
+		return p, err2
+	}
+	if p.CreatedAt, err2 = parseTime(created); err2 != nil {
+		return p, err2
+	}
+	if p.UpdatedAt, err2 = parseTime(updated); err2 != nil {
+		return p, err2
+	}
+	p.EpisodeCount = epCount
+	p.UnplayedCount = unplayed
+	return p, nil
+}
+
+const podcastCountCols = `,
+			(SELECT COUNT(*) FROM episodes e WHERE e.podcast_id = p.id),
+			(SELECT COUNT(*) FROM episodes e WHERE e.podcast_id = p.id AND e.played_at IS NULL)`
+
 // FindPodcastByURL matches submitted or resolved feed URL (normalized comparison is caller's job).
 func (s *Store) FindPodcastByURL(ctx context.Context, url string) (model.Podcast, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT `+podcastSelectCols+` FROM podcasts p
-		WHERE p.feed_url = ? COLLATE NOCASE OR p.resolved_url = ? COLLATE NOCASE
+		SELECT `+podcastSelectCols+podcastCountCols+`
+		FROM podcasts p
+		WHERE p.feed_url = ? COLLATE BINARY OR p.resolved_url = ? COLLATE BINARY
 		LIMIT 1`, url, url)
-	p, err := scanPodcast(row)
+	p, err := scanPodcastWithCounts(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, false, nil
 	}
@@ -169,10 +239,11 @@ func (s *Store) FindPodcastByURL(ctx context.Context, url string) (model.Podcast
 // FindPodcastByAlias matches alias case-insensitively.
 func (s *Store) FindPodcastByAlias(ctx context.Context, alias string) (model.Podcast, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT `+podcastSelectCols+` FROM podcasts p
+		SELECT `+podcastSelectCols+podcastCountCols+`
+		FROM podcasts p
 		WHERE p.alias = ? COLLATE NOCASE
 		LIMIT 1`, alias)
-	p, err := scanPodcast(row)
+	p, err := scanPodcastWithCounts(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, false, nil
 	}
@@ -291,79 +362,6 @@ func (s *Store) AliasExists(ctx context.Context, alias string, excludeID int64) 
 	return n > 0, nil
 }
 
-// UpdatePodcastFetch records a fetch attempt outcome.
-func (s *Store) UpdatePodcastFetch(ctx context.Context, id int64, success bool, httpStatus *int, etag, lastMod, lastErr *string, meta *PodcastMetaUpdate, now time.Time) error {
-	nowS := formatTime(now.UTC())
-	return s.withTx(ctx, func(tx *sql.Tx) error {
-		if success {
-			_, err := tx.ExecContext(ctx, `
-				UPDATE podcasts SET
-					last_attempt_at = ?,
-					last_success_at = ?,
-					last_http_status = ?,
-					etag = COALESCE(?, etag),
-					last_modified = COALESCE(?, last_modified),
-					last_error = NULL,
-					title = COALESCE(?, title),
-					author = COALESCE(?, author),
-					description = COALESCE(?, description),
-					resolved_url = COALESCE(?, resolved_url),
-					updated_at = ?
-				WHERE id = ?`,
-				nowS, nowS, nullInt(httpStatus),
-				nullString(etag), nullString(lastMod),
-				nullString(metaTitle(meta)), nullString(metaAuthor(meta)), nullString(metaDesc(meta)),
-				nullString(metaResolved(meta)),
-				nowS, id,
-			)
-			return fmtErr("update podcast success", err)
-		}
-		_, err := tx.ExecContext(ctx, `
-			UPDATE podcasts SET
-				last_attempt_at = ?,
-				last_http_status = ?,
-				last_error = ?,
-				updated_at = ?
-			WHERE id = ?`,
-			nowS, nullInt(httpStatus), nullString(lastErr), nowS, id,
-		)
-		return fmtErr("update podcast failure", err)
-	})
-}
-
-// PodcastMetaUpdate holds optional metadata fields from a successful fetch.
-type PodcastMetaUpdate struct {
-	Title       *string
-	Author      *string
-	Description *string
-	ResolvedURL *string
-}
-
-func metaTitle(m *PodcastMetaUpdate) *string {
-	if m == nil {
-		return nil
-	}
-	return m.Title
-}
-func metaAuthor(m *PodcastMetaUpdate) *string {
-	if m == nil {
-		return nil
-	}
-	return m.Author
-}
-func metaDesc(m *PodcastMetaUpdate) *string {
-	if m == nil {
-		return nil
-	}
-	return m.Description
-}
-func metaResolved(m *PodcastMetaUpdate) *string {
-	if m == nil {
-		return nil
-	}
-	return m.ResolvedURL
-}
-
 // EpisodeCount returns the number of episodes for a podcast.
 func (s *Store) EpisodeCount(ctx context.Context, podcastID int64) (int, error) {
 	var n int
@@ -374,14 +372,43 @@ func (s *Store) EpisodeCount(ctx context.Context, podcastID int64) (int, error) 
 	return n, nil
 }
 
+func dedupeBaselineEpisodes(items []BaselineEpisode) []BaselineEpisode {
+	seenIdentity := make(map[string]struct{}, len(items))
+	seenGUID := make(map[string]struct{}, len(items))
+	seenEnclosure := make(map[string]struct{}, len(items))
+	out := make([]BaselineEpisode, 0, len(items))
+	for _, item := range items {
+		duplicate := false
+		if item.IdentityKey != "" {
+			_, duplicate = seenIdentity[item.IdentityKey]
+		}
+		if !duplicate && item.GUID != nil && *item.GUID != "" {
+			_, duplicate = seenGUID[*item.GUID]
+		}
+		if !duplicate && item.EnclosureURL != "" {
+			_, duplicate = seenEnclosure[item.EnclosureURL]
+		}
+		if duplicate {
+			continue
+		}
+		if item.IdentityKey != "" {
+			seenIdentity[item.IdentityKey] = struct{}{}
+		}
+		if item.GUID != nil && *item.GUID != "" {
+			seenGUID[*item.GUID] = struct{}{}
+		}
+		if item.EnclosureURL != "" {
+			seenEnclosure[item.EnclosureURL] = struct{}{}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 // ValidateAlias checks alias rules.
 func ValidateAlias(alias string) error {
-	a := strings.TrimSpace(alias)
-	if a == "" {
+	if alias == "" || strings.TrimSpace(alias) == "" {
 		return model.InvalidArgument("alias must not be empty")
-	}
-	if a != alias {
-		// caller should trim; still accept after trim check
 	}
 	if strings.TrimSpace(alias) != alias {
 		return model.InvalidArgument("alias must not have leading or trailing whitespace")

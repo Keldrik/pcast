@@ -1,6 +1,7 @@
 package feed
 
 import (
+	"net"
 	"net/url"
 	"strings"
 
@@ -19,6 +20,7 @@ func NormalizeURL(raw string) (string, error) {
 	if err != nil {
 		return "", model.InvalidArgumentf("invalid URL: %v", err)
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", model.InvalidArgumentf("URL scheme must be http or https, got %q", u.Scheme)
 	}
@@ -28,7 +30,6 @@ func NormalizeURL(raw string) (string, error) {
 	if u.User != nil {
 		return "", model.InvalidArgument("URL must not contain embedded credentials")
 	}
-	u.Scheme = strings.ToLower(u.Scheme)
 	host := strings.ToLower(u.Hostname())
 	port := u.Port()
 	switch {
@@ -37,9 +38,14 @@ func NormalizeURL(raw string) (string, error) {
 	case port == "443" && u.Scheme == "https":
 		port = ""
 	}
-	if port != "" {
+	switch {
+	case strings.Contains(host, ":") && port != "":
+		u.Host = net.JoinHostPort(host, port)
+	case strings.Contains(host, ":"):
+		u.Host = "[" + host + "]"
+	case port != "":
 		u.Host = host + ":" + port
-	} else {
+	default:
 		u.Host = host
 	}
 	if u.Path == "" {
@@ -60,5 +66,6 @@ func IsHTTPURL(s string) bool {
 	if err != nil {
 		return false
 	}
-	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "http" || scheme == "https") && u.Host != ""
 }

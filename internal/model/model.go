@@ -24,8 +24,8 @@ type Podcast struct {
 	LastError      *string    `json:"last_error"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
-	EpisodeCount   int        `json:"episode_count,omitempty"`
-	UnplayedCount  int        `json:"unplayed_count,omitempty"`
+	EpisodeCount   int        `json:"episode_count"`
+	UnplayedCount  int        `json:"unplayed_count"`
 }
 
 // Episode is a playable feed item with stable local identity.

@@ -10,6 +10,7 @@ import (
 )
 
 // Add subscribes to a feed URL, baselining current episodes.
+// Network fetch runs outside the app lock; DB writes run under the lock.
 func (a *App) Add(ctx context.Context, feedURL string, alias string) (model.AddResult, error) {
 	norm, err := feed.NormalizeURL(feedURL)
 	if err != nil {
@@ -25,55 +26,60 @@ func (a *App) Add(ctx context.Context, feedURL string, alias string) (model.AddR
 		aliasPtr = &alias
 	}
 
+	// Fast local duplicate check without holding the lock during network I/O.
+	if existing, ok, err := a.Store.FindPodcastByURL(ctx, norm); err != nil {
+		return model.AddResult{}, err
+	} else if ok {
+		return a.addExisting(ctx, existing, aliasPtr)
+	}
+
+	if aliasPtr != nil {
+		exists, err := a.Store.AliasExists(ctx, *aliasPtr, 0)
+		if err != nil {
+			return model.AddResult{}, err
+		}
+		if exists {
+			return model.AddResult{}, model.InvalidArgumentf("alias %q is already in use", *aliasPtr)
+		}
+	}
+
+	parsed, err := a.Feeds.Fetch(ctx, FetchOpts{URL: norm})
+	if err != nil {
+		return model.AddResult{}, err
+	}
+	if parsed.NotModified {
+		return model.AddResult{}, model.InvalidFeed("feed returned 304 on initial fetch", nil)
+	}
+
+	if parsed.ResolvedURL != "" && parsed.ResolvedURL != norm {
+		if existing, ok, err := a.Store.FindPodcastByURL(ctx, parsed.ResolvedURL); err != nil {
+			return model.AddResult{}, err
+		} else if ok {
+			return a.addExisting(ctx, existing, aliasPtr)
+		}
+	}
+
 	var result model.AddResult
 	err = a.locker().WithLock(ctx, func(ctx context.Context) error {
-		// Idempotent duplicate URL check (submitted or resolved).
+		// Re-check under lock (concurrent add).
 		if existing, ok, err := a.Store.FindPodcastByURL(ctx, norm); err != nil {
 			return err
 		} else if ok {
-			count, err := a.Store.EpisodeCount(ctx, existing.ID)
-			if err != nil {
-				return err
-			}
-			result = model.AddResult{Podcast: existing, Created: false, EpisodeCount: count, ImportedCount: 0}
-			return nil
-		}
-
-		if aliasPtr != nil {
-			exists, err := a.Store.AliasExists(ctx, *aliasPtr, 0)
-			if err != nil {
-				return err
-			}
-			if exists {
-				return model.InvalidArgumentf("alias %q is already in use", *aliasPtr)
-			}
-		}
-
-		parsed, err := a.Feeds.Fetch(ctx, FetchOpts{URL: norm})
-		if err != nil {
+			r, err := a.addExisting(ctx, existing, aliasPtr)
+			result = r
 			return err
 		}
-		if parsed.NotModified {
-			// Unlikely on first fetch without validators; treat as invalid.
-			return model.InvalidFeed("feed returned 304 on initial fetch", nil)
-		}
-
-		// Also check resolved URL for duplicates.
 		if parsed.ResolvedURL != "" && parsed.ResolvedURL != norm {
 			if existing, ok, err := a.Store.FindPodcastByURL(ctx, parsed.ResolvedURL); err != nil {
 				return err
 			} else if ok {
-				count, err := a.Store.EpisodeCount(ctx, existing.ID)
-				if err != nil {
-					return err
-				}
-				result = model.AddResult{Podcast: existing, Created: false, EpisodeCount: count, ImportedCount: 0}
-				return nil
+				r, err := a.addExisting(ctx, existing, aliasPtr)
+				result = r
+				return err
 			}
 		}
 
 		if aliasPtr != nil {
-			// Re-check after fetch in case of race (lock held).
 			exists, err := a.Store.AliasExists(ctx, *aliasPtr, 0)
 			if err != nil {
 				return err
@@ -103,6 +109,19 @@ func (a *App) Add(ctx context.Context, feedURL string, alias string) (model.AddR
 			Now:         a.now(),
 		})
 		if err != nil {
+			// Unique race on URL/alias: surface as existing when possible.
+			if existing, ok, findErr := a.Store.FindPodcastByURL(ctx, norm); findErr == nil && ok {
+				r, err2 := a.addExisting(ctx, existing, aliasPtr)
+				result = r
+				return err2
+			}
+			if parsed.ResolvedURL != "" {
+				if existing, ok, findErr := a.Store.FindPodcastByURL(ctx, parsed.ResolvedURL); findErr == nil && ok {
+					r, err2 := a.addExisting(ctx, existing, aliasPtr)
+					result = r
+					return err2
+				}
+			}
 			return err
 		}
 		result = model.AddResult{
@@ -114,6 +133,23 @@ func (a *App) Add(ctx context.Context, feedURL string, alias string) (model.AddR
 		return nil
 	})
 	return result, err
+}
+
+func (a *App) addExisting(ctx context.Context, existing model.Podcast, alias *string) (model.AddResult, error) {
+	if alias != nil {
+		exists, err := a.Store.AliasExists(ctx, *alias, existing.ID)
+		if err != nil {
+			return model.AddResult{}, err
+		}
+		if exists {
+			return model.AddResult{}, model.InvalidArgumentf("alias %q is already in use", *alias)
+		}
+	}
+	// Find*/Get paths attach EpisodeCount; use that for the add envelope.
+	return model.AddResult{
+		Podcast: existing, Created: false,
+		EpisodeCount: existing.EpisodeCount, ImportedCount: 0,
+	}, nil
 }
 
 func toBaseline(ep model.ParsedEpisode) store.BaselineEpisode {

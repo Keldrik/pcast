@@ -150,6 +150,56 @@ func TestFetchCancel(t *testing.T) {
 	}
 }
 
+func TestRelativeEnclosureResolved(t *testing.T) {
+	body := `<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<title>Rel</title>
+<link>https://media.example/show/</link>
+<item>
+<title>One</title>
+<enclosure url="ep/one.mp3" type="audio/mpeg" length="1"/>
+</item>
+</channel></rss>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := feed.NewClient("pcast-test")
+	parsed, err := c.Fetch(context.Background(), feed.FetchOptions{URL: srv.URL + "/feed.xml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Episodes) != 1 {
+		t.Fatalf("episodes=%v", parsed.Episodes)
+	}
+	want := srv.URL + "/ep/one.mp3"
+	if parsed.Episodes[0].EnclosureURL != want {
+		t.Fatalf("enclosure=%q want %q", parsed.Episodes[0].EnclosureURL, want)
+	}
+}
+
+func TestRejectsNonAudioEnclosures(t *testing.T) {
+	body := `<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<title>Media</title><link>https://example.test/show/</link>
+<item><title>Video</title><enclosure url="video.mp4" type="video/mp4"/></item>
+<item><title>HTML</title><enclosure url="page.html" type="text/html"/></item>
+<item><title>Audio</title><enclosure url="audio.mp3" type="audio/mpeg"/></item>
+</channel></rss>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	parsed, err := feed.NewClient("pcast-test").Fetch(context.Background(), feed.FetchOptions{URL: srv.URL + "/feed.xml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Episodes) != 1 || parsed.Episodes[0].Title != "Audio" {
+		t.Fatalf("episodes=%+v", parsed.Episodes)
+	}
+}
+
 func TestIdentityStable(t *testing.T) {
 	g := "abc"
 	k1 := feed.IdentityKey(&g, "https://cdn/x.mp3", "T", nil, nil, nil)

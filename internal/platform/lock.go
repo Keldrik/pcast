@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -31,7 +32,7 @@ func (l *Lock) Acquire(ctx context.Context) error {
 		return model.LockUnavailable("lock is not configured", nil)
 	}
 	// Ensure parent directory exists.
-	if err := os.MkdirAll(dirOf(l.path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
 		return model.LockUnavailable("create lock directory", err)
 	}
 
@@ -80,13 +81,4 @@ func (l *Lock) WithLock(ctx context.Context, fn func(context.Context) error) err
 	}
 	defer func() { _ = l.Release() }()
 	return fn(ctx)
-}
-
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' || path[i] == '\\' {
-			return path[:i]
-		}
-	}
-	return "."
 }

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"io"
 	"time"
 
 	"github.com/Keldrik/pcast/internal/model"
@@ -40,6 +39,10 @@ type FetchOpts struct {
 	ETag         *string
 	LastModified *string
 }
+
+// StoreOpener opens the local database for diagnostics when normal command
+// initialization has not already opened it.
+type StoreOpener func(context.Context, string) (StorePort, error)
 
 // Player runs external playback.
 type Player interface {
@@ -96,6 +99,8 @@ type App struct {
 	Lock        Locker
 	Clock       Clock
 	DataDir     string
+	DBPath      string
+	OpenStore   StoreOpener
 	Concurrency int
 	Version     model.VersionInfo
 }
@@ -129,11 +134,3 @@ func (a *App) locker() Locker {
 	}
 	return a.Lock
 }
-
-// OutputWriter is used to write command results before acknowledgement.
-type OutputWriter interface {
-	Write(p []byte) (n int, err error)
-}
-
-// Ensure io.Writer satisfies.
-var _ io.Writer = (OutputWriter)(nil)

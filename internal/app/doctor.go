@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Keldrik/pcast/internal/model"
 	"github.com/Keldrik/pcast/internal/platform"
@@ -11,50 +12,81 @@ import (
 
 // Doctor runs non-destructive diagnostics.
 func (a *App) Doctor(ctx context.Context) (model.DoctorResult, error) {
-	dir := a.DataDir
-	res := model.DoctorResult{
-		DataDir: dir,
-		Checks:  []model.DoctorCheck{},
-		OK:      true,
-	}
+	res := model.DoctorResult{DataDir: a.DataDir, Checks: []model.DoctorCheck{}, OK: true}
+	dataDirOK := false
 
-	// Data directory resolve/create/write.
-	if dir == "" {
+	if a.DataDir == "" {
 		res.Checks = append(res.Checks, model.DoctorCheck{
 			Name: "data_dir", Status: "error", Message: "data directory is not configured",
 		})
 		res.OK = false
-	} else {
-		if err := platform.EnsureDataDir(dir); err != nil {
-			res.Checks = append(res.Checks, model.DoctorCheck{
-				Name: "data_dir", Status: "error", Message: err.Error(),
-			})
-			res.OK = false
-		} else {
-			// Probe write
-			probe := dir + string(os.PathSeparator) + ".pcast-doctor-write-probe"
-			if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
-				res.Checks = append(res.Checks, model.DoctorCheck{
-					Name: "data_dir", Status: "error", Message: "not writable: " + err.Error(),
-				})
-				res.OK = false
-			} else {
-				_ = os.Remove(probe)
-				res.Checks = append(res.Checks, model.DoctorCheck{
-					Name: "data_dir", Status: "ok", Message: dir,
-				})
-			}
-		}
-	}
-
-	// Database / schema
-	if a.Store == nil {
+	} else if err := platform.EnsureDataDir(a.DataDir); err != nil {
 		res.Checks = append(res.Checks, model.DoctorCheck{
-			Name: "database", Status: "error", Message: "store is not configured",
+			Name: "data_dir", Status: "error", Message: err.Error(),
+		})
+		res.OK = false
+	} else if _, err := os.ReadDir(a.DataDir); err != nil {
+		res.Checks = append(res.Checks, model.DoctorCheck{
+			Name: "data_dir", Status: "error", Message: "not readable: " + err.Error(),
 		})
 		res.OK = false
 	} else {
-		ver, err := a.Store.SchemaVersion(ctx)
+		probe := filepath.Join(a.DataDir, ".pcast-doctor-write-probe")
+		if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+			res.Checks = append(res.Checks, model.DoctorCheck{
+				Name: "data_dir", Status: "error", Message: "not writable: " + err.Error(),
+			})
+			res.OK = false
+		} else if err := os.Remove(probe); err != nil {
+			res.Checks = append(res.Checks, model.DoctorCheck{
+				Name: "data_dir", Status: "error", Message: "cannot remove write probe: " + err.Error(),
+			})
+			res.OK = false
+		} else {
+			dataDirOK = true
+			res.Checks = append(res.Checks, model.DoctorCheck{
+				Name: "data_dir", Status: "ok", Message: a.DataDir,
+			})
+		}
+	}
+
+	st := a.Store
+	opened := false
+	var openErr error
+	if st == nil && dataDirOK {
+		path := a.DBPath
+		if path == "" {
+			path = filepath.Join(a.DataDir, "pcast.db")
+		}
+		if a.OpenStore == nil {
+			openErr = fmt.Errorf("store opener is not configured")
+		} else {
+			openedStore, err := a.OpenStore(ctx, path)
+			openErr = err
+			if err != nil {
+				st = nil
+			} else {
+				st = openedStore
+				opened = st != nil
+			}
+		}
+	}
+	if opened {
+		defer func() { _ = st.Close() }()
+	}
+
+	if st == nil {
+		message := "database not checked: data directory unavailable"
+		if openErr != nil {
+			message = openErr.Error()
+		}
+		res.Checks = append(res.Checks,
+			model.DoctorCheck{Name: "database", Status: "error", Message: message},
+			model.DoctorCheck{Name: "foreign_keys", Status: "error", Message: "not checked: database unavailable"},
+		)
+		res.OK = false
+	} else {
+		ver, err := st.SchemaVersion(ctx)
 		if err != nil {
 			res.Checks = append(res.Checks, model.DoctorCheck{
 				Name: "database", Status: "error", Message: err.Error(),
@@ -65,7 +97,7 @@ func (a *App) Doctor(ctx context.Context) (model.DoctorResult, error) {
 				Name: "database", Status: "ok", Message: fmt.Sprintf("schema version %d", ver),
 			})
 		}
-		fk, err := a.Store.ForeignKeysEnabled(ctx)
+		fk, err := st.ForeignKeysEnabled(ctx)
 		if err != nil {
 			res.Checks = append(res.Checks, model.DoctorCheck{
 				Name: "foreign_keys", Status: "error", Message: err.Error(),
@@ -83,7 +115,6 @@ func (a *App) Doctor(ctx context.Context) (model.DoctorResult, error) {
 		}
 	}
 
-	// Player
 	if a.Player == nil {
 		res.Checks = append(res.Checks, model.DoctorCheck{
 			Name: "player", Status: "warn", Message: "player is not configured",
